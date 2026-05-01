@@ -19,6 +19,10 @@ use tower_http::timeout::TimeoutLayer;
 pub struct AppState {
     pub ledger: Arc<db::Ledger>,
     pub crypto: crypto::CryptoService,
+    pub escrow: services::EscrowService,
+    /// Static bearer token for the admin API.  Loaded from `ADMIN_TOKEN` at
+    /// startup; never logged, never returned in any HTTP response.
+    pub admin_token: String,
 }
 
 async fn health() -> &'static str {
@@ -34,8 +38,17 @@ async fn main() {
     let rpc_url = env::var("MONERO_RPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:18083/json_rpc".to_string());
 
+    // Fail-secure: refuse to start without a strong admin bearer token.
+    // The minimum length (32 chars) defends against accidental
+    // misconfiguration with a short, brute-forceable secret.
+    let admin_token = env::var("ADMIN_TOKEN")
+        .unwrap_or_else(|_| panic!("FATAL: ADMIN_TOKEN environment variable is not set"));
+    if admin_token.len() < 32 {
+        panic!("FATAL: ADMIN_TOKEN must be at least 32 characters long");
+    }
+
     let ledger = Arc::new(db::Ledger::new(&db_path));
-    let _escrow = services::EscrowService::new(Arc::clone(&ledger));
+    let escrow = services::EscrowService::new(Arc::clone(&ledger));
 
     // Two independent CryptoService instances share the same wallet RPC
     // endpoint; each owns its own reqwest::Client (Arc-backed, cheap to clone).
@@ -50,7 +63,12 @@ async fn main() {
     let scanner = services::BlockchainScanner::new(Arc::clone(&ledger), crypto_scanner);
     tokio::spawn(scanner.start_polling());
 
-    let state = Arc::new(AppState { ledger, crypto });
+    let state = Arc::new(AppState {
+        ledger,
+        crypto,
+        escrow,
+        admin_token,
+    });
 
     // Remove stale socket file before binding (fail-secure: no ghost sockets).
     if std::path::Path::new(&socket_path).exists() {
@@ -62,6 +80,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .merge(api::user_routes::user_router())
+        .merge(api::admin_routes::admin_router())
         .with_state(state)
         .layer(TimeoutLayer::new(Duration::from_secs(10)));
 
