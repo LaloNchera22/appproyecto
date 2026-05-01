@@ -1,3 +1,4 @@
+mod crypto;
 mod db;
 
 use axum::{routing::get, Router};
