@@ -1,32 +1,27 @@
 services:
   tor:
-    image: tor:alpine
-    container_name: tor
+    image: osminogin/tor-simple
     networks:
       - tor_net
     volumes:
-      - tor_uds:/var/run/tor/
+      - ./infra/tor/keys:/var/lib/tor/hidden_service/
+      - tor_socket_dir:/var/run/tor/
       - ./tor/torrc:/etc/tor/torrc:ro
-      - tor_data:/var/lib/tor/
     read_only: true
-    cap_drop:
-      - ALL
-    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
 
   proxy:
     image: nginx:alpine
-    container_name: proxy
     networks:
       - app_net
     volumes:
-      - tor_uds:/var/run/tor/
+      - tor_socket_dir:/var/run/tor/
+      - app_socket_dir:/var/run/app/
       - ./nginx/proxy_seguro.conf:/etc/nginx/nginx.conf:ro
-      - nginx_run:/var/run/
-      - nginx_cache:/var/cache/nginx/
     read_only: true
     cap_drop:
       - ALL
-    restart: unless-stopped
 
 networks:
   tor_net:
@@ -35,7 +30,5 @@ networks:
     internal: true
 
 volumes:
-  tor_uds:
-  tor_data:
-  nginx_run:
-  nginx_cache:
+  tor_socket_dir:
+  app_socket_dir:
