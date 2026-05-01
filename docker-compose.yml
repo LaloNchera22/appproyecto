@@ -1,60 +1,41 @@
 services:
-  nginx:
-    image: nginx:alpine
-    container_name: sicbox-nginx
-    # Nginx acts as the bridge, exposed to tor_net but also able to talk to app_net via UDS
+  tor:
+    image: tor:alpine
+    container_name: tor
     networks:
       - tor_net
-      - app_net
     volumes:
-      - uds_data:/var/run/sicbox
-    # No TCP ports mapped to host. Only external connection is via Tor.
+      - tor_uds:/var/run/tor/
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - tor_data:/var/lib/tor/
+    read_only: true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
-  backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: sicbox-backend
-    # Backend ONLY exists on the internal isolated network
+  proxy:
+    image: nginx:alpine
+    container_name: proxy
     networks:
       - app_net
     volumes:
-      - uds_data:/var/run/sicbox
-      - ledger_data:/app/data/ledger
-    environment:
-      - UDS_PATH=/var/run/sicbox/sicbox.sock
-    # No TCP ports exposed.
-    restart: unless-stopped
-
-  monero_node:
-    image: lscr.io/linuxserver/monero:latest
-    container_name: sicbox-monero
-    # Monero node ONLY exists on the internal isolated network
-    networks:
-      - app_net
-    volumes:
-      - monero_data:/config
-    command: >
-      monerod
-      --rpc-bind-ip=0.0.0.0
-      --rpc-bind-port=18081
-      --restricted-rpc
-      --confirm-external-bind
-      --non-interactive
-      --hide-my-port
-      --offline
-    # No TCP ports exposed to the host.
+      - tor_uds:/var/run/tor/
+      - ./nginx/proxy_seguro.conf:/etc/nginx/nginx.conf:ro
+      - nginx_run:/var/run/
+      - nginx_cache:/var/cache/nginx/
+    read_only: true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
 networks:
   tor_net:
-    driver: bridge
+    internal: false
   app_net:
-    driver: bridge
     internal: true
 
 volumes:
-  uds_data:
-  ledger_data:
-  monero_data:
+  tor_uds:
+  tor_data:
+  nginx_run:
+  nginx_cache:

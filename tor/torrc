@@ -1,0 +1,3 @@
+HiddenServiceDir /var/lib/tor/hidden_service/
+HiddenServicePort 80 unix:/var/run/tor/hidden_service.sock
+HiddenServiceVersion 3
