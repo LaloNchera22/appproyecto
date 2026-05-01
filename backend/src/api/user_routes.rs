@@ -115,6 +115,21 @@ async fn participate(
             )
         })?;
 
+    // Persist the subaddress in the ledger so the scanner can detect and
+    // credit the deposit when it arrives on-chain.  Without this step the
+    // scanner has no knowledge of the address and the deposit would be lost.
+    state
+        .ledger
+        .register_subaddress(&payload.event_id, payload.option, &address)
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Payment gateway temporarily unavailable",
+                }),
+            )
+        })?;
+
     Ok(Json(ParticipateResponse {
         deposit_address: address,
     }))

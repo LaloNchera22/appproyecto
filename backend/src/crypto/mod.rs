@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// JSON-RPC wire types
+// JSON-RPC wire types — create_address
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -41,9 +41,56 @@ struct RpcError {
 }
 
 // ---------------------------------------------------------------------------
+// JSON-RPC wire types — get_transfers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct GetTransfersRpcRequest<'a> {
+    jsonrpc: &'a str,
+    id: &'a str,
+    method: &'a str,
+    params: GetTransfersParams,
+}
+
+#[derive(Serialize)]
+struct GetTransfersParams {
+    // `in` is a Rust keyword; renamed on the wire.
+    #[serde(rename = "in")]
+    incoming: bool,
+    pool: bool,
+    account_index: u32,
+}
+
+#[derive(Deserialize)]
+struct GetTransfersRpcResponse {
+    result: Option<GetTransfersResult>,
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct GetTransfersResult {
+    #[serde(rename = "in", default)]
+    incoming: Vec<TransferEntry>,
+    #[serde(default)]
+    pool: Vec<TransferEntry>,
+}
+
+/// A single transfer record returned by the Monero Wallet RPC.
+/// Used by `BlockchainScanner` to detect and credit confirmed deposits.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TransferEntry {
+    pub address: String,
+    pub amount: u64,
+    pub confirmations: u64,
+    pub double_spend_seen: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
+/// `Clone` is cheap — `reqwest::Client` is `Arc`-backed internally.
+#[derive(Clone)]
 pub struct CryptoService {
     rpc_url: String,
     http_client: Client,
@@ -129,6 +176,63 @@ impl CryptoService {
                 eprintln!("[crypto] RPC result missing or contained empty address");
                 Err("Payment gateway temporarily unavailable".to_string())
             }
+        }
+    }
+
+    /// Pull all incoming (`in`) and unconfirmed (`pool`) transfers from the
+    /// local Monero Wallet RPC.
+    ///
+    /// This is a strict PULL operation — the engine initiates every request.
+    /// The existing 5-second HTTP timeout enforced by the client applies here,
+    /// so a non-responsive node cannot stall the scanner indefinitely.
+    ///
+    /// Returns the combined list; callers filter by confirmation depth.
+    /// On any failure the generic sentinel is returned (no internal detail leak).
+    pub async fn get_transfers(&self) -> Result<Vec<TransferEntry>, String> {
+        let payload = GetTransfersRpcRequest {
+            jsonrpc: "2.0",
+            id: "0",
+            method: "get_transfers",
+            params: GetTransfersParams {
+                incoming: true,
+                pool: true,
+                account_index: 0,
+            },
+        };
+
+        let response = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("[crypto] get_transfers transport error: {e}");
+                "Payment gateway temporarily unavailable".to_string()
+            })?;
+
+        if !response.status().is_success() {
+            eprintln!("[crypto] get_transfers HTTP {}", response.status());
+            return Err("Payment gateway temporarily unavailable".to_string());
+        }
+
+        let rpc_response: GetTransfersRpcResponse = response.json().await.map_err(|e| {
+            eprintln!("[crypto] get_transfers deserialization error: {e}");
+            "Payment gateway temporarily unavailable".to_string()
+        })?;
+
+        if rpc_response.error.is_some() {
+            eprintln!("[crypto] get_transfers RPC daemon returned an error object");
+            return Err("Payment gateway temporarily unavailable".to_string());
+        }
+
+        match rpc_response.result {
+            Some(r) => {
+                let mut transfers = r.incoming;
+                transfers.extend(r.pool);
+                Ok(transfers)
+            }
+            None => Ok(Vec::new()),
         }
     }
 }
