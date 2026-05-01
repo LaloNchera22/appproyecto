@@ -1,7 +1,7 @@
 // backend/src/db/mod.rs
 use std::collections::HashMap;
 
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use serde_json;
 
 use crate::models::{Event, EventStatus, Tournament};
@@ -38,6 +38,29 @@ impl Ledger {
             Some(data) => serde_json::from_slice(&data).map_err(|e| e.to_string()),
             None => Err(format!("event '{}' not found", id)),
         }
+    }
+
+    /// Scans the ledger and returns all events whose status is `Open`.
+    ///
+    /// Uses a forward key-range scan from the `"event:"` prefix boundary so
+    /// only event records are read; other key families are never touched.
+    /// Any record that fails to deserialize is silently skipped rather than
+    /// aborting the entire scan.
+    pub fn get_open_events(&self) -> Vec<Event> {
+        let prefix = PREFIX_EVENT.as_bytes();
+        self.db
+            .iterator(IteratorMode::From(prefix, Direction::Forward))
+            .take_while(|item| {
+                item.as_ref()
+                    .map(|(k, _)| k.starts_with(prefix))
+                    .unwrap_or(false)
+            })
+            .filter_map(|item| {
+                item.ok()
+                    .and_then(|(_, v)| serde_json::from_slice::<Event>(&v).ok())
+            })
+            .filter(|e| e.status == EventStatus::Open)
+            .collect()
     }
 
     pub fn put_event(&self, event: &Event) -> Result<(), String> {
