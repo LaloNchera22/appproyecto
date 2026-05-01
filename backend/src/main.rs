@@ -1,4 +1,5 @@
 // backend/src/main.rs
+mod api;
 mod crypto;
 mod db;
 mod engine;
@@ -12,6 +13,14 @@ use tokio::net::UnixListener;
 use tower::Service;
 use tower_http::timeout::TimeoutLayer;
 
+/// Shared application state injected into every request handler via Axum's
+/// `State` extractor.  Wrapped in `Arc` so it can be cheaply cloned across
+/// async tasks without copying the underlying resources.
+pub struct AppState {
+    pub ledger: Arc<db::Ledger>,
+    pub crypto: crypto::CryptoService,
+}
+
 async fn health() -> &'static str {
     "OK"
 }
@@ -22,9 +31,16 @@ async fn main() {
         .unwrap_or_else(|_| "./data/ledger".to_string());
     let socket_path = env::var("SOCKET_PATH")
         .unwrap_or_else(|_| "/tmp/app/engine.sock".to_string());
+    let rpc_url = env::var("MONERO_RPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18083/json_rpc".to_string());
 
     let ledger = Arc::new(db::Ledger::new(&db_path));
     let _escrow = services::EscrowService::new(Arc::clone(&ledger));
+
+    let crypto = crypto::CryptoService::new(rpc_url)
+        .unwrap_or_else(|e| panic!("FATAL: cannot initialise CryptoService: {}", e));
+
+    let state = Arc::new(AppState { ledger, crypto });
 
     // Remove stale socket file before binding (fail-secure: no ghost sockets).
     if std::path::Path::new(&socket_path).exists() {
@@ -35,6 +51,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/health", get(health))
+        .merge(api::user_routes::user_router())
+        .with_state(state)
         .layer(TimeoutLayer::new(Duration::from_secs(10)));
 
     let listener = UnixListener::bind(&socket_path)
