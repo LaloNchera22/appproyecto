@@ -1,29 +1,17 @@
 // backend/src/main.rs
-mod api;
-mod crypto;
-mod db;
-mod engine;
-mod models;
-mod services;
+//
+// Runtime entry point.  All engine code lives in the `sicbox` library crate
+// (see `lib.rs`); this file is purely the Tokio bootstrap and the UDS accept
+// loop, kept minimal so integration tests under `tests/` can exercise the
+// same code paths via the library target.
 
 use axum::{routing::get, Router};
 use hyper_util::rt::TokioIo;
+use sicbox::{api, crypto, db, services, AppState};
 use std::{env, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
 use tower::Service;
 use tower_http::timeout::TimeoutLayer;
-
-/// Shared application state injected into every request handler via Axum's
-/// `State` extractor.  Wrapped in `Arc` so it can be cheaply cloned across
-/// async tasks without copying the underlying resources.
-pub struct AppState {
-    pub ledger: Arc<db::Ledger>,
-    pub crypto: crypto::CryptoService,
-    pub escrow: services::EscrowService,
-    /// Static bearer token for the admin API.  Loaded from `ADMIN_TOKEN` at
-    /// startup; never logged, never returned in any HTTP response.
-    pub admin_token: String,
-}
 
 async fn health() -> &'static str {
     "OK"
