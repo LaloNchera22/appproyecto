@@ -1,5 +1,9 @@
+// backend/src/main.rs
 mod crypto;
 mod db;
+mod engine;
+mod models;
+mod services;
 
 use axum::{routing::get, Router};
 use hyper_util::rt::TokioIo;
@@ -19,7 +23,8 @@ async fn main() {
     let socket_path = env::var("SOCKET_PATH")
         .unwrap_or_else(|_| "/tmp/app/engine.sock".to_string());
 
-    let _ledger = Arc::new(db::Ledger::new(&db_path));
+    let ledger = Arc::new(db::Ledger::new(&db_path));
+    let _escrow = services::EscrowService::new(Arc::clone(&ledger));
 
     // Remove stale socket file before binding (fail-secure: no ghost sockets).
     if std::path::Path::new(&socket_path).exists() {
