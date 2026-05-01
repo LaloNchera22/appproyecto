@@ -12,6 +12,9 @@ use crate::models::{Event, EventStatus, Tournament};
 const PREFIX_EVENT:   &str = "event:";
 const PREFIX_PAYOUTS: &str = "payouts:";
 const PREFIX_TOURNEY: &str = "tournament:";
+/// Written by the scanner once a deposit has been credited; prevents
+/// double-processing across polling intervals.
+const PREFIX_FUNDED:  &str = "funded:";
 
 pub struct Ledger {
     db: DB,
@@ -133,5 +136,84 @@ impl Ledger {
         let key = format!("{}{}", PREFIX_TOURNEY, id);
         let data = serde_json::to_vec(tournament).map_err(|e| e.to_string())?;
         self.db.put(key.as_bytes(), &data).map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Deposit / scanner API
+    // -----------------------------------------------------------------------
+
+    /// Register a freshly generated deposit subaddress against an event option.
+    ///
+    /// Inserts `subaddress -> 0` into `event.option_pools[option]`, marking the
+    /// address as "pending deposit".  The scanner will later call
+    /// `record_deposit_atomic` to credit the actual net amount.
+    pub fn register_subaddress(
+        &self,
+        event_id: &str,
+        option: u8,
+        subaddress: &str,
+    ) -> Result<(), String> {
+        let mut event = self.get_event(event_id)?;
+        event
+            .option_pools
+            .entry(option)
+            .or_default()
+            .entry(subaddress.to_string())
+            .or_insert(0);
+        self.put_event(&event)
+    }
+
+    /// Returns `true` if this subaddress has already been credited by the
+    /// scanner.  Errors from RocksDB are treated conservatively as `false`
+    /// (the scanner's atomic write has its own re-entrancy guard).
+    pub fn is_subaddress_funded(&self, subaddress: &str) -> bool {
+        let key = format!("{}{}", PREFIX_FUNDED, subaddress);
+        self.db.get(key.as_bytes()).unwrap_or(None).is_some()
+    }
+
+    /// Atomically credit `net_amount` piconeros to an event option pool and
+    /// mark the subaddress as funded so it is never scanned again.
+    ///
+    /// A single `WriteBatch` guarantees that either both the updated event
+    /// record and the funded marker land on disk, or neither does.  The funded
+    /// marker is checked first for idempotency — if already present the call
+    /// returns `Ok(())` without writing anything.
+    pub fn record_deposit_atomic(
+        &self,
+        event_id: &str,
+        option: u8,
+        subaddress: &str,
+        net_amount: u64,
+    ) -> Result<(), String> {
+        // Idempotency: a previous iteration may have already processed this.
+        if self.is_subaddress_funded(subaddress) {
+            return Ok(());
+        }
+
+        let mut event = self.get_event(event_id)?;
+
+        // Update per-subaddress contribution.
+        event
+            .option_pools
+            .entry(option)
+            .or_default()
+            .insert(subaddress.to_string(), net_amount);
+
+        // Update running pool total; overflow on a u64 piconero total would
+        // require ~18 million XMR in a single pool — guard it anyway.
+        let total = event.pool_totals.entry(option).or_insert(0);
+        *total = total
+            .checked_add(net_amount)
+            .ok_or_else(|| format!("pool total overflow for event '{}'", event_id))?;
+
+        let event_key  = format!("{}{}", PREFIX_EVENT,  event_id);
+        let funded_key = format!("{}{}", PREFIX_FUNDED, subaddress);
+        let event_bytes = serde_json::to_vec(&event).map_err(|e| e.to_string())?;
+
+        let mut batch = WriteBatch::default();
+        batch.put(event_key.as_bytes(),  &event_bytes);
+        batch.put(funded_key.as_bytes(), b"1");
+
+        self.db.write(batch).map_err(|e| e.to_string())
     }
 }

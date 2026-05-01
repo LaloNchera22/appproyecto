@@ -37,8 +37,18 @@ async fn main() {
     let ledger = Arc::new(db::Ledger::new(&db_path));
     let _escrow = services::EscrowService::new(Arc::clone(&ledger));
 
+    // Two independent CryptoService instances share the same wallet RPC
+    // endpoint; each owns its own reqwest::Client (Arc-backed, cheap to clone).
+    let crypto_scanner = crypto::CryptoService::new(rpc_url.clone())
+        .unwrap_or_else(|e| panic!("FATAL: cannot initialise scanner CryptoService: {}", e));
     let crypto = crypto::CryptoService::new(rpc_url)
         .unwrap_or_else(|e| panic!("FATAL: cannot initialise CryptoService: {}", e));
+
+    // Spawn the blockchain scanner as an independent background Tokio task.
+    // It runs on the same runtime as Axum but never blocks the web server —
+    // slow or failed RPC calls only affect the scanner's own polling cycle.
+    let scanner = services::BlockchainScanner::new(Arc::clone(&ledger), crypto_scanner);
+    tokio::spawn(scanner.start_polling());
 
     let state = Arc::new(AppState { ledger, crypto });
 
