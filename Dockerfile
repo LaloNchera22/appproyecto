@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /v
 WORKDIR /app
 
 # Copy the binary from the builder stage
-COPY --from=builder /usr/src/sicbox/backend/target/release/outname .
+COPY --from=builder /usr/src/sicbox/backend/target/release/sicbox .
 
 # Create directory for the immutable ledger (RocksDB)
 RUN mkdir -p /app/data/ledger
