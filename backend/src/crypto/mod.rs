@@ -1,7 +1,16 @@
 // backend/src/crypto/mod.rs
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Hard ceilings
+// ---------------------------------------------------------------------------
+
+/// Maximum body size accepted from the wallet RPC.  A legitimate
+/// `get_transfers` reply is well under this; anything larger is rejected
+/// before deserialisation to defuse RPC memory bombs (Finding #4).
+const MAX_RPC_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types — create_address
@@ -86,6 +95,36 @@ pub struct TransferEntry {
 }
 
 // ---------------------------------------------------------------------------
+// JSON-RPC wire types — get_balance
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct GetBalanceRpcRequest<'a> {
+    jsonrpc: &'a str,
+    id: &'a str,
+    method: &'a str,
+    params: GetBalanceParams,
+}
+
+#[derive(Serialize)]
+struct GetBalanceParams {
+    account_index: u32,
+}
+
+#[derive(Deserialize)]
+struct GetBalanceRpcResponse {
+    result: Option<GetBalanceResult>,
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct GetBalanceResult {
+    /// Total piconeros currently spendable (excludes locked / unconfirmed).
+    /// Exposed by the Monero Wallet RPC as `unlocked_balance`.
+    unlocked_balance: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
@@ -101,20 +140,54 @@ impl CryptoService {
     ///
     /// The client is configured with a 5-second total timeout so the backend
     /// cannot hang indefinitely if the local wallet daemon is unresponsive.
+    /// Body-size capping is enforced separately by `read_capped_json` to guard
+    /// against memory-bomb responses (Finding #4) — `reqwest` itself does not
+    /// expose a payload-size cap on `Client`.
     pub fn new(rpc_url: String) -> Result<Self, String> {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(5))
             // Disable clearnet redirects; the wallet RPC is local-only.
             .redirect(reqwest::redirect::Policy::none())
-            // Reject any response that is obviously too large to be a valid
-            // JSON-RPC reply from a wallet daemon (guards against memory bombs).
-            .connection_verbose(false)
             .build()
             .map_err(|_| "Payment gateway configuration error".to_string())?;
 
         Ok(Self {
             rpc_url,
             http_client,
+        })
+    }
+
+    /// Stream a JSON-RPC response body into a bounded buffer and deserialize
+    /// it.  Aborts with a generic sentinel error if the body grows past
+    /// `MAX_RPC_BODY_BYTES`, defusing memory-bomb attacks from a compromised
+    /// wallet daemon (Finding #4).
+    async fn read_capped_json<T>(mut response: Response) -> Result<T, String>
+    where
+        T: for<'de> serde::Deserialize<'de>,
+    {
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if buf.len().saturating_add(chunk.len()) > MAX_RPC_BODY_BYTES {
+                        eprintln!(
+                            "[crypto] RPC body exceeded {} bytes — aborting",
+                            MAX_RPC_BODY_BYTES
+                        );
+                        return Err("Payment gateway temporarily unavailable".to_string());
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[crypto] body read error: {e}");
+                    return Err("Payment gateway temporarily unavailable".to_string());
+                }
+            }
+        }
+        serde_json::from_slice::<T>(&buf).map_err(|e| {
+            eprintln!("[crypto] JSON parse error: {e}");
+            "Payment gateway temporarily unavailable".to_string()
         })
     }
 
@@ -159,10 +232,7 @@ impl CryptoService {
             return Err("Payment gateway temporarily unavailable".to_string());
         }
 
-        let rpc_response: RpcResponse = response.json().await.map_err(|e| {
-            eprintln!("[crypto] RPC response deserialization error: {e}");
-            "Payment gateway temporarily unavailable".to_string()
-        })?;
+        let rpc_response: RpcResponse = Self::read_capped_json(response).await?;
 
         // An explicit JSON-RPC error object from the daemon is still an error.
         if rpc_response.error.is_some() {
@@ -184,7 +254,9 @@ impl CryptoService {
     ///
     /// This is a strict PULL operation — the engine initiates every request.
     /// The existing 5-second HTTP timeout enforced by the client applies here,
-    /// so a non-responsive node cannot stall the scanner indefinitely.
+    /// so a non-responsive node cannot stall the scanner indefinitely.  The
+    /// response is read via `read_capped_json` so a malicious daemon cannot
+    /// stream a multi-GB body to exhaust the engine's heap (Finding #4).
     ///
     /// Returns the combined list; callers filter by confirmation depth.
     /// On any failure the generic sentinel is returned (no internal detail leak).
@@ -216,10 +288,7 @@ impl CryptoService {
             return Err("Payment gateway temporarily unavailable".to_string());
         }
 
-        let rpc_response: GetTransfersRpcResponse = response.json().await.map_err(|e| {
-            eprintln!("[crypto] get_transfers deserialization error: {e}");
-            "Payment gateway temporarily unavailable".to_string()
-        })?;
+        let rpc_response: GetTransfersRpcResponse = Self::read_capped_json(response).await?;
 
         if rpc_response.error.is_some() {
             eprintln!("[crypto] get_transfers RPC daemon returned an error object");
@@ -233,6 +302,55 @@ impl CryptoService {
                 Ok(transfers)
             }
             None => Ok(Vec::new()),
+        }
+    }
+
+    /// Probe the wallet's currently-unlocked balance (account 0) in
+    /// piconeros.  Used by the escrow service to refuse settlement when the
+    /// declared payout map exceeds the wallet's actual XMR holdings — the
+    /// last line of defence against a compromised RPC inflating pool totals
+    /// (Finding #5b).
+    ///
+    /// Same Zero-Trust error contract as the other RPC methods: every
+    /// internal cause is logged to stderr and collapsed into the same
+    /// opaque sentinel string before returning to the caller.
+    pub async fn get_unlocked_balance(&self) -> Result<u64, String> {
+        let payload = GetBalanceRpcRequest {
+            jsonrpc: "2.0",
+            id: "0",
+            method: "get_balance",
+            params: GetBalanceParams { account_index: 0 },
+        };
+
+        let response = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("[crypto] get_balance transport error: {e}");
+                "Payment gateway temporarily unavailable".to_string()
+            })?;
+
+        if !response.status().is_success() {
+            eprintln!("[crypto] get_balance HTTP {}", response.status());
+            return Err("Payment gateway temporarily unavailable".to_string());
+        }
+
+        let rpc_response: GetBalanceRpcResponse = Self::read_capped_json(response).await?;
+
+        if rpc_response.error.is_some() {
+            eprintln!("[crypto] get_balance RPC daemon returned an error object");
+            return Err("Payment gateway temporarily unavailable".to_string());
+        }
+
+        match rpc_response.result {
+            Some(r) => Ok(r.unlocked_balance),
+            None => {
+                eprintln!("[crypto] get_balance result missing");
+                Err("Payment gateway temporarily unavailable".to_string())
+            }
         }
     }
 }

@@ -247,6 +247,7 @@ async fn resolve_event(
     state
         .escrow
         .resolve_event(&event_id, payload.winning_option)
+        .await
         .map_err(|e| {
             // Internal-only logging.  Engine and RocksDB messages are never
             // echoed to the caller — they could reveal ledger invariants

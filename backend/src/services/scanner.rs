@@ -13,7 +13,7 @@
 //   • All monetary arithmetic uses integer math (piconeros, u64).
 //     No floating-point operations anywhere in this file.
 //   • Every confirmed deposit is written atomically: pool update + funded
-//     marker land in a single RocksDB WriteBatch or not at all.
+//     marker land in a single RocksDB optimistic transaction or not at all.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +33,13 @@ const PLATFORM_FEE_DIVISOR: u64 = 100;
 
 /// Interval between consecutive RPC polls.
 const POLL_INTERVAL_SECS: u64 = 60;
+
+/// Maximum piconeros credited from a single transfer.  Tighter than the
+/// XMR supply ceiling so a fabricated `amount` from a compromised wallet RPC
+/// cannot inflate a pool past the platform's real holdings (Finding #5a).
+/// Set at 1 000 XMR — well above any plausible legitimate deposit while
+/// hard-capping the blast radius of an oracle-poisoning attack.
+const MAX_PICONEROS_PER_TRANSFER: u64 = 1_000 * 1_000_000_000_000;
 
 // ---------------------------------------------------------------------------
 // BlockchainScanner
@@ -54,8 +61,9 @@ impl BlockchainScanner {
     /// Loop invariants:
     ///   1. Only OPEN events are examined.
     ///   2. Only subaddresses without a `funded:` marker are queried.
-    ///   3. Only transfers with ≥ `REQUIRED_CONFIRMATIONS` blocks and no
-    ///      double-spend flag are credited.
+    ///   3. Only transfers with ≥ `REQUIRED_CONFIRMATIONS` blocks, no
+    ///      double-spend flag, and `amount ≤ MAX_PICONEROS_PER_TRANSFER`
+    ///      are credited.
     ///   4. If the wallet RPC is unreachable, the iteration is skipped
     ///      gracefully — the task does not panic.
     pub async fn start_polling(self) {
@@ -74,7 +82,11 @@ impl BlockchainScanner {
             //   deposit_address  →  (event_id, option_index)
             //
             // Subaddresses already marked `funded:` in RocksDB are excluded so
-            // they are never re-processed.
+            // they are never re-processed.  Read failures from
+            // `is_subaddress_funded` are treated conservatively as
+            // "skip this subaddress for now" — we never default to "not
+            // funded" because that would re-credit on every transient I/O
+            // error (Finding #3).
             // ------------------------------------------------------------------
             let open_events = self.ledger.get_open_events();
 
@@ -82,11 +94,21 @@ impl BlockchainScanner {
             for event in &open_events {
                 for (&option, pool) in &event.option_pools {
                     for subaddress in pool.keys() {
-                        if !self.ledger.is_subaddress_funded(subaddress) {
-                            pending.insert(
-                                subaddress.clone(),
-                                (event.id.clone(), option),
-                            );
+                        match self.ledger.is_subaddress_funded(subaddress) {
+                            Ok(false) => {
+                                pending.insert(
+                                    subaddress.clone(),
+                                    (event.id.clone(), option),
+                                );
+                            }
+                            Ok(true) => { /* already credited, skip */ }
+                            Err(e) => {
+                                eprintln!(
+                                    "[scanner] funded-marker read failed for {}: {} \
+                                     — skipping until next tick",
+                                    subaddress, e
+                                );
+                            }
                         }
                     }
                 }
@@ -116,13 +138,24 @@ impl BlockchainScanner {
             };
 
             // ------------------------------------------------------------------
-            // Step 3 — Process each transfer that meets confirmation threshold.
+            // Step 3 — Process each transfer that meets all sanity gates.
             // ------------------------------------------------------------------
             for transfer in &transfers {
                 // Reject unconfirmed and double-spend-flagged entries.
                 if transfer.double_spend_seen
                     || transfer.confirmations < REQUIRED_CONFIRMATIONS
                 {
+                    continue;
+                }
+
+                // Per-transfer sanity cap.  A compromised RPC could otherwise
+                // mint arbitrary balance against any subaddress the engine
+                // has ever issued (Finding #5a).
+                if transfer.amount > MAX_PICONEROS_PER_TRANSFER {
+                    eprintln!(
+                        "[scanner] transfer.amount {} exceeds per-tx cap {} — dropped",
+                        transfer.amount, MAX_PICONEROS_PER_TRANSFER
+                    );
                     continue;
                 }
 
@@ -146,15 +179,15 @@ impl BlockchainScanner {
                 };
 
                 // ------------------------------------------------------------------
-                // Atomic ledger update:
-                //   • option_pools[option][subaddress] ← net_amount
-                //   • pool_totals[option]              += net_amount
+                // Atomic ledger update under optimistic concurrency control:
+                //   • option_pools[option][subaddress] ← net_amount (delta-aware)
+                //   • pool_totals[option]              += delta
                 //   • funded:{subaddress}              ← "1"
                 //
-                // All three writes land in a single RocksDB WriteBatch so a crash
-                // mid-write cannot leave the ledger in a partially-credited state.
-                // The `funded:` marker also provides idempotency if this iteration
-                // is interrupted and retried.
+                // All three writes commit in a single optimistic transaction;
+                // the read-set on the event key forces concurrent
+                // settlement / participation writers to retry instead of
+                // silently overwriting.
                 // ------------------------------------------------------------------
                 if let Err(e) = self.ledger.record_deposit_atomic(
                     event_id,
