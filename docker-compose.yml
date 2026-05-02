@@ -1,4 +1,26 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - app_socket_dir:/var/run/app/
+      - app_data:/app/data
+    environment:
+      DATABASE_PATH: /app/data/ledger
+      SOCKET_PATH: /var/run/app/engine.sock
+      MONERO_RPC_URL: http://host.docker.internal:18083/json_rpc
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set in .env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 500
+    mem_limit: 512m
+    restart: unless-stopped
+
   tor:
     image: osminogin/tor-simple
     networks:
@@ -47,3 +69,4 @@ networks:
 volumes:
   tor_socket_dir:
   app_socket_dir:
+  app_data:
