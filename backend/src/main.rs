@@ -29,21 +29,33 @@ async fn main() {
     // Fail-secure: refuse to start without a strong admin bearer token.
     // The minimum length (32 chars) defends against accidental
     // misconfiguration with a short, brute-forceable secret.
-    let admin_token = env::var("ADMIN_TOKEN")
-        .unwrap_or_else(|_| panic!("FATAL: ADMIN_TOKEN environment variable is not set"));
+    let admin_token = env::var("ADMIN_TOKEN").unwrap_or_else(|_| {
+        eprintln!("[main] ADMIN_TOKEN environment variable is not set");
+        panic!("FATAL: missing required configuration");
+    });
     if admin_token.len() < 32 {
-        panic!("FATAL: ADMIN_TOKEN must be at least 32 characters long");
+        eprintln!("[main] ADMIN_TOKEN length below required minimum");
+        panic!("FATAL: invalid admin configuration");
     }
 
     let ledger = Arc::new(db::Ledger::new(&db_path));
-    let escrow = services::EscrowService::new(Arc::clone(&ledger));
 
-    // Two independent CryptoService instances share the same wallet RPC
+    // Three independent CryptoService instances share the same wallet RPC
     // endpoint; each owns its own reqwest::Client (Arc-backed, cheap to clone).
-    let crypto_scanner = crypto::CryptoService::new(rpc_url.clone())
-        .unwrap_or_else(|e| panic!("FATAL: cannot initialise scanner CryptoService: {}", e));
-    let crypto = crypto::CryptoService::new(rpc_url)
-        .unwrap_or_else(|e| panic!("FATAL: cannot initialise CryptoService: {}", e));
+    let crypto_scanner = crypto::CryptoService::new(rpc_url.clone()).unwrap_or_else(|e| {
+        eprintln!("[main] scanner CryptoService init error: {}", e);
+        panic!("FATAL: cannot initialise scanner crypto component");
+    });
+    let crypto_escrow = crypto::CryptoService::new(rpc_url.clone()).unwrap_or_else(|e| {
+        eprintln!("[main] escrow CryptoService init error: {}", e);
+        panic!("FATAL: cannot initialise escrow crypto component");
+    });
+    let crypto = crypto::CryptoService::new(rpc_url).unwrap_or_else(|e| {
+        eprintln!("[main] CryptoService init error: {}", e);
+        panic!("FATAL: cannot initialise crypto component");
+    });
+
+    let escrow = services::EscrowService::new(Arc::clone(&ledger), crypto_escrow);
 
     // Spawn the blockchain scanner as an independent background Tokio task.
     // It runs on the same runtime as Axum but never blocks the web server —
@@ -61,7 +73,8 @@ async fn main() {
     // Remove stale socket file before binding (fail-secure: no ghost sockets).
     if std::path::Path::new(&socket_path).exists() {
         std::fs::remove_file(&socket_path).unwrap_or_else(|e| {
-            panic!("FATAL: cannot remove stale socket '{}': {}", socket_path, e)
+            eprintln!("[main] cannot remove stale socket {}: {}", socket_path, e);
+            panic!("FATAL: stale socket cleanup failed");
         });
     }
 
@@ -72,16 +85,25 @@ async fn main() {
         .with_state(state)
         .layer(TimeoutLayer::new(Duration::from_secs(10)));
 
-    let listener = UnixListener::bind(&socket_path)
-        .unwrap_or_else(|e| panic!("FATAL: cannot bind UDS at '{}': {}", socket_path, e));
+    let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
+        eprintln!("[main] UDS bind error at {}: {}", socket_path, e);
+        panic!("FATAL: cannot bind UDS");
+    });
 
     println!("Engine listening on unix:{}", socket_path);
 
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .unwrap_or_else(|e| panic!("FATAL: accept error: {}", e));
+        // Transient `accept` errors (EMFILE — too many open files,
+        // ECONNABORTED, kernel resource pressure) MUST NOT crash the engine.
+        // Log them and back off so the loop does not spin tightly on EMFILE.
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("[main] accept error (continuing): {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
 
         let app = app.clone();
 
@@ -90,10 +112,12 @@ async fn main() {
                 app.clone().call(req.map(axum::body::Body::new))
             });
 
-            hyper::server::conn::http1::Builder::new()
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
                 .await
-                .unwrap_or_else(|e| eprintln!("connection error: {e}"));
+            {
+                eprintln!("[main] connection error: {e}");
+            }
         });
     }
 }

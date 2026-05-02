@@ -12,8 +12,12 @@
 //     inputs to assert that overflow is surfaced as `Err`, never as a panic.
 //   • A genuine Unix Domain Socket bind is performed via
 //     `tokio::net::UnixListener` to confirm the strict transport boundary.
+//   • A minimal in-process mock Monero Wallet RPC is spawned for the
+//     escrow double-spend test, so the wallet-balance reconciliation
+//     check (Finding #5b) is exercised end-to-end without depending on a
+//     real wallet daemon.
 //
-// All four tests are isolated: each opens its own RocksDB instance inside a
+// All tests are isolated: each opens its own RocksDB instance inside a
 // fresh `TempDir`, which is removed automatically when the test ends.
 
 use std::collections::HashMap;
@@ -22,8 +26,10 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
-    Router,
+    routing::post,
+    Json, Router,
 };
+use serde_json::{json, Value};
 use sicbox::api::{admin_routes::admin_router, user_routes::user_router};
 use sicbox::crypto::CryptoService;
 use sicbox::db::Ledger;
@@ -32,7 +38,7 @@ use sicbox::models::Event;
 use sicbox::services::EscrowService;
 use sicbox::AppState;
 use tempfile::TempDir;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tower::ServiceExt;
 
 /// Admin bearer token used by the auth tests.  Length matches the production
@@ -40,10 +46,61 @@ use tower::ServiceExt;
 const TEST_ADMIN_TOKEN: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// Spawn a tiny mock Monero Wallet RPC on an ephemeral loopback port and
+/// return the JSON-RPC URL pointing at it.  The mock answers every JSON-RPC
+/// call by echoing a fixed `unlocked_balance`, which is sufficient for tests
+/// that only need `get_balance` (escrow's reconciliation probe).  Other
+/// methods are stubbed with the same payload — fields the caller does not
+/// expect are ignored on deserialisation.
+async fn spawn_mock_wallet_rpc(unlocked_balance: u64) -> String {
+    // The mock does not switch on `method`; every JSON-RPC call returns a
+    // `result` object that satisfies the strict subset of fields the engine
+    // cares about across all RPC methods exercised in tests (get_balance,
+    // create_address, get_transfers).  Fields the caller does not expect are
+    // ignored on deserialisation.
+    let balance = unlocked_balance;
+    let app = Router::new().route(
+        "/json_rpc",
+        post(move |Json(_req): Json<Value>| {
+            let bal = balance;
+            async move {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "0",
+                    "result": {
+                        "balance": bal,
+                        "unlocked_balance": bal,
+                        "address": "MOCK_ADDR",
+                        "address_index": 0,
+                        "in": [],
+                        "pool": []
+                    }
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock RPC must bind to an ephemeral loopback port");
+    let port = listener.local_addr().expect("mock listener has addr").port();
+    tokio::spawn(async move {
+        // `axum::serve` runs until the listener is dropped; for these tests
+        // it lives for the lifetime of the test process.
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+
+    format!("http://127.0.0.1:{}/json_rpc", port)
+}
+
 /// Build a complete `AppState` backed by a fresh RocksDB ledger inside `tmp`.
 ///
 /// The `TempDir` is owned by the caller — keep it alive for the lifetime of
 /// the state, otherwise the database directory is unlinked while in use.
+///
+/// The crypto service is constructed with a localhost-loopback URL that
+/// will never respond.  Tests that exercise escrow settlement (which probes
+/// the wallet RPC) build their own state via `make_state_with_rpc` instead.
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
     let db_path = tmp.path().join("ledger");
     let ledger = Arc::new(Ledger::new(
@@ -51,13 +108,9 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
             .to_str()
             .expect("tempdir path must be valid UTF-8"),
     ));
-    let escrow = EscrowService::new(Arc::clone(&ledger));
-
-    // The crypto service is constructed but never used in these tests; a
-    // localhost-loopback URL is sufficient to satisfy the constructor and
-    // guarantees that no outbound network call is ever attempted.
     let crypto = CryptoService::new("http://127.0.0.1:1/json_rpc".to_string())
         .expect("CryptoService must build with a syntactically valid URL");
+    let escrow = EscrowService::new(Arc::clone(&ledger), crypto.clone());
 
     Arc::new(AppState {
         ledger,
@@ -234,11 +287,13 @@ async fn test_parimutuel_math_safety() {
 /// operator pay every losing pool twice.
 ///
 /// The test:
-///   1. Creates a realistic event in a real RocksDB ledger.
-///   2. Calls `resolve_event` once — must succeed and write payouts.
-///   3. Calls `resolve_event` a second time — must return `Err` with a
+///   1. Spawns an in-process mock wallet RPC that reports a balance large
+///      enough to satisfy the escrow's reconciliation probe (Finding #5b).
+///   2. Creates a realistic event in a real RocksDB ledger.
+///   3. Calls `resolve_event` once — must succeed and write payouts.
+///   4. Calls `resolve_event` a second time — must return `Err` with a
 ///      message that explicitly references the double-spend guard.
-///   4. Confirms the persisted payout map was NOT overwritten.
+///   5. Confirms the persisted payout map was NOT overwritten.
 #[tokio::test]
 async fn test_escrow_double_spend_prevention() {
     let tmp = TempDir::new().expect("tempdir must be creatable");
@@ -248,7 +303,12 @@ async fn test_escrow_double_spend_prevention() {
             .to_str()
             .expect("tempdir path must be valid UTF-8"),
     ));
-    let escrow = EscrowService::new(Arc::clone(&ledger));
+
+    // Wallet RPC mock that always reports a sufficient unlocked balance, so
+    // the wallet-balance reconciliation in escrow does not block settlement.
+    let rpc_url = spawn_mock_wallet_rpc(u64::MAX).await;
+    let crypto = CryptoService::new(rpc_url).expect("CryptoService must build");
+    let escrow = EscrowService::new(Arc::clone(&ledger), crypto);
 
     // Build a minimal but realistic two-option event: option 0 wins, with a
     // single subaddress on the winning side and a non-zero losing pool.
@@ -269,6 +329,7 @@ async fn test_escrow_double_spend_prevention() {
     // ---- First resolution: must succeed ------------------------------------
     escrow
         .resolve_event(event_id, 0)
+        .await
         .expect("first resolve must succeed on an Open event");
 
     let first_payouts = ledger
@@ -280,7 +341,7 @@ async fn test_escrow_double_spend_prevention() {
     );
 
     // ---- Second resolution: must be refused --------------------------------
-    let second = escrow.resolve_event(event_id, 0);
+    let second = escrow.resolve_event(event_id, 0).await;
     assert!(
         second.is_err(),
         "second resolve must be refused, got Ok(...)"
@@ -300,5 +361,70 @@ async fn test_escrow_double_spend_prevention() {
     assert_eq!(
         first_payouts, after_payouts,
         "payout map must be byte-identical after the rejected second call"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — Wallet-balance reconciliation refuses underfunded settlement
+// ---------------------------------------------------------------------------
+
+/// Finding #5b regression: when the wallet's `unlocked_balance` is *below*
+/// the declared payout sum, `resolve_event` MUST refuse to commit settlement
+/// and the event MUST remain Open.  This guards against a compromised wallet
+/// RPC inflating pool totals via fabricated transfers and tricking the
+/// operator into authorising a payout map that the wallet cannot actually
+/// fund.
+#[tokio::test]
+async fn test_escrow_refuses_when_balance_insufficient() {
+    let tmp = TempDir::new().expect("tempdir must be creatable");
+    let db_path = tmp.path().join("ledger");
+    let ledger = Arc::new(Ledger::new(
+        db_path
+            .to_str()
+            .expect("tempdir path must be valid UTF-8"),
+    ));
+
+    // Mock wallet reports zero unlocked balance — below any non-trivial payout.
+    let rpc_url = spawn_mock_wallet_rpc(0).await;
+    let crypto = CryptoService::new(rpc_url).expect("CryptoService must build");
+    let escrow = EscrowService::new(Arc::clone(&ledger), crypto);
+
+    let event_id = "evt-underfunded";
+    let mut event = Event::new(event_id);
+    let mut pool_winner: HashMap<String, u64> = HashMap::new();
+    pool_winner.insert("subaddr_winner".to_string(), 1_000_000);
+    event.option_pools.insert(0, pool_winner);
+    event.option_pools.insert(1, HashMap::new());
+    event.pool_totals.insert(0, 1_000_000);
+    event.pool_totals.insert(1, 500_000);
+
+    ledger
+        .put_event(&event)
+        .expect("event must persist in the real ledger");
+
+    let result = escrow.resolve_event(event_id, 0).await;
+    assert!(
+        result.is_err(),
+        "settlement must be refused when unlocked balance < payout sum"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("insufficient wallet balance"),
+        "error must reference the balance-reconciliation guard, got: {}",
+        msg
+    );
+
+    // Event must remain Open and no payout entry may exist.
+    let after = ledger
+        .get_event(event_id)
+        .expect("event must still be readable after refused settlement");
+    assert_eq!(
+        after.status,
+        sicbox::models::EventStatus::Open,
+        "event must remain Open when settlement was refused"
+    );
+    assert!(
+        ledger.get_payouts(event_id).is_err(),
+        "payout map must NOT have been written for a refused settlement"
     );
 }
