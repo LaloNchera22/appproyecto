@@ -1,0 +1,17 @@
+# Runtime secrets — never commit real tokens or wallet keys
+.env
+*.env
+
+# RocksDB ledger data — binary blobs with no value in version control
+data/
+
+# Tor hidden service private key material — exposing hs_ed25519_secret_key
+# permanently deanonymizes the .onion address.
+tor/keys/*
+!tor/keys/.gitkeep
+
+# Build artifacts
+target/
+node_modules/
+.next/
+out/
