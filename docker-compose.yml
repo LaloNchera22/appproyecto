@@ -22,7 +22,10 @@ services:
     restart: unless-stopped
 
   tor:
-    image: osminogin/tor-simple
+    build:
+      context: ./tor
+      dockerfile: Dockerfile
+    user: "0"
     networks:
       - tor_net
     volumes:
