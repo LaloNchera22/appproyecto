@@ -1,3 +1,33 @@
+# Hardened Tor v3 hidden service configuration.
+# Defense-in-depth: explicitly disable every listener that is not required
+# so a future container joining tor_net cannot abuse Tor as a SOCKS pivot.
+
+SocksPort 0
+ControlPort 0
+DNSPort 0
+TransPort 0
+NATDPort 0
+
+# Hidden service definition (UDS path is shared with the nginx proxy via the
+# tor_socket_dir named volume).
 HiddenServiceDir /var/lib/tor/hidden_service/
 HiddenServicePort 80 unix:/var/run/tor/hidden_service.sock
 HiddenServiceVersion 3
+HiddenServiceDirGroupReadable 0
+HiddenServiceNonAnonymousMode 0
+HiddenServiceSingleHopMode 0
+
+# Introduction-point DoS defense (v3 onion services).
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServiceEnableIntroDoSBurstPerSec 200
+HiddenServiceEnableIntroDoSRatePerSec 25
+
+# Logging: redact sensitive material, keep output on stderr only.
+SafeLogging 1
+Log notice stderr
+ProtocolWarnings 1
+DisableDebuggerAttachment 1
+
+# Reduce fingerprint surface: no IPv6 fallback unless explicitly required.
+ClientUseIPv6 0
+ClientPreferIPv6ORPort 0

@@ -4,12 +4,19 @@ services:
     networks:
       - tor_net
     volumes:
-      - ./infra/tor/keys:/var/lib/tor/hidden_service/
+      - ./tor/keys:/var/lib/tor/hidden_service/
       - tor_socket_dir:/var/run/tor/
       - ./tor/torrc:/etc/tor/torrc:ro
     read_only: true
+    tmpfs:
+      - /var/lib/tor:size=32M,mode=0700
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    pids_limit: 200
+    mem_limit: 256m
+    restart: unless-stopped
 
   proxy:
     image: nginx:alpine
@@ -20,8 +27,16 @@ services:
       - app_socket_dir:/var/run/app/
       - ./nginx/proxy_seguro.conf:/etc/nginx/nginx.conf:ro
     read_only: true
+    tmpfs:
+      - /var/run:size=2M,mode=0755
+      - /var/cache/nginx:size=16M,mode=0755
     cap_drop:
       - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 200
+    mem_limit: 128m
+    restart: unless-stopped
 
 networks:
   tor_net:
