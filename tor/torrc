@@ -2,6 +2,12 @@
 # Defense-in-depth: explicitly disable every listener that is not required
 # so a future container joining tor_net cannot abuse Tor as a SOCKS pivot.
 
+# Drop privileges immediately after startup.
+# The Alpine tor package creates user/group tor (UID/GID 100).
+# The tmpfs at /var/lib/tor is initialized with uid=100,gid=100 so the tor
+# process can access its data directory after the privilege drop.
+User tor
+
 SocksPort 0
 ControlPort 0
 DNSPort 0

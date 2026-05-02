@@ -90,6 +90,21 @@ async fn main() {
         panic!("FATAL: cannot bind UDS");
     });
 
+    // Make the socket world-accessible so the nginx proxy worker (running as
+    // the nginx user) can connect.  Without this the socket inherits the
+    // process umask (typically 0022 → mode 0755) and the "other" write bit
+    // is missing, which causes EACCES on connect from a different UID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(0o777),
+        ) {
+            eprintln!("[main] socket chmod failed: {e}");
+        }
+    }
+
     println!("Engine listening on unix:{}", socket_path);
 
     loop {
