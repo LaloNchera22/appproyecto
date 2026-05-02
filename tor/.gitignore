@@ -1,0 +1,3 @@
+# Tor v3 hidden service private key material — must never be committed.
+# A leaked hs_ed25519_secret_key permanently deanonymizes the .onion address.
+keys/
